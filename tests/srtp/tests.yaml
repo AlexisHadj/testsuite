@@ -6,3 +6,5 @@ tests:
     - test: 'srtp_t140_audio'
     - test: 'srtp_t140_red'
     - test: 'srtp_t140_red_audio'
+    - test: 'text_noaudio'
+    - test: 'text_toggle_voice_NEW'

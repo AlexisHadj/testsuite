@@ -8,3 +8,4 @@ tests:
     - test: 'rtt_red_audio'
     - test: 'rtt_t140'
     - test: 'rtt_t140_audio'
+    - test: 'rtt_red_t140_audio_idlepackets'

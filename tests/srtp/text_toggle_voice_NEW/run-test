@@ -1,0 +1,490 @@
+#!/usr/bin/env python3
+import sys
+import os
+import logging
+import time
+import signal
+from asterisk.test_case import TestCase
+from twisted.internet import reactor
+
+
+import pjsua as pj
+class Python3CompatiblePjsuaError(Exception):
+    def __init__(self, op_name, obj, err_code, err_msg=""):
+        super().__init__(f"Object: {obj}, operation={op_name}, error={err_msg} ({err_code})")
+        self.op_name = op_name
+        self.obj = obj
+        self.err_code = err_code
+        self._err_msg = err_msg
+
+    def err_msg(self):
+        return self._err_msg
+
+pj.Error = Python3CompatiblePjsuaError
+import _pjsua
+
+LOGGER = logging.getLogger(__name__)
+
+en_txt = "Real-time text (RTT) transmitted"
+gr_txt = "πραγματικό κείμενο σε χρόνο"
+de_txt = "Echtzeittext übertragen"
+cn_txt = "已发送实时文本"
+am_txt = "Իրական ժամանակի տեքստ"
+hi_txt = "वास्तविक समय का पाठ"
+wakeup_txt = " " # emptystring "" does not work "\r\n" works
+# Global string buffers to catch RTT updates from callbacks
+TX_LOG_BUFFER = ""
+RX_LOG_BUFFER = ""
+
+# Inherit CallCallback to listen for events happening inside a call
+class MyCallCallback(pj.CallCallback):
+    def __init__(self, call=None, is_rx=False):
+        pj.CallCallback.__init__(self, call)
+        self.is_rx = is_rx
+
+    def on_state(self):
+        LOGGER.info(f"Call state changed to: {self.call.info().state_text} (Code: {self.call.info().state})")        
+        print(f"Call state changed to: {self.call.info().state_text} (Code: {self.call.info().state})")
+
+    def on_media_state(self):
+        LOGGER.info("Media state update received.")
+
+    def on_call_rx_text(self, call_id, text_param):
+        global TX_LOG_BUFFER, RX_LOG_BUFFER
+
+        decoded_text = text_param.strip()
+
+        LOGGER.info(f"RTT RECEIVED [{'RX (102)' if self.is_rx else 'TX (101)'}]: {decoded_text}")
+
+        if self.is_rx:
+            RX_LOG_BUFFER += f" Incoming text: {decoded_text}\n"
+        else:
+            TX_LOG_BUFFER += f" Incoming text: {decoded_text}\n"
+
+
+class MyAccountCallback(pj.AccountCallback):
+    def __init__(self, account=None):
+        pj.AccountCallback.__init__(self, account)
+    #Implementation of event handler -- on_incoming_call method
+    def on_incoming_call(self, call):
+        LOGGER.info("Incoming call detected on Receiver account (102). Auto-answering...")
+        call_cb = MyCallCallback(call, is_rx=True)
+        call.answer(200, "OK")
+        call.set_callback(call_cb)
+        SRTPTest.instance.rx_call = call
+
+
+class SRTPTest(TestCase):
+    instance = None
+
+    def __init__(self):
+        super(SRTPTest, self).__init__()
+        SRTPTest.instance = self
+        self.reactor_timeout = 90
+        self.create_asterisk(count=1)
+        self.ast[0].all_out = True
+
+        self.tx_lib = None
+        self.rx_lib = None
+        self.tx_call = None
+        self.rx_call = None
+
+    def run(self):
+        super(SRTPTest, self).run()
+        LOGGER.info("Starting Asterisk...")
+        self.ast[0].cli_exec("rtp set debug on")
+        self.ast[0].cli_exec("pjsip set logger on")
+        reactor.callLater(3, self.start_pjsua)
+
+    def init_pjsua_instance(self):
+        import gc
+
+        # Forcefully destroy any old pjsua instances and collect them from memory
+        try:
+            if hasattr(self, 'lib') and self.lib:
+                self.lib.destroy()
+                self.lib = None
+        except Exception:
+            pass
+
+        # Force Python 3.11 to free up any dead variables holding sockets
+        gc.collect()
+
+        lib = pj.Lib()
+
+        # Equivalent to log levels and media parameters
+        ua_cfg = pj.UAConfig()
+        ua_cfg.max_calls = 4
+
+        media_cfg = pj.MediaConfig()
+        media_cfg.no_vad = True  # --no-vad Equivalent
+        media_cfg.quality = 10
+        media_cfg.max_media_ports = 32
+
+
+        # Value 2 =PJSUA_SRTP_MANDATORY
+        media_cfg.srtp_mode = 2
+        media_cfg.srtp_secure_signaling = 0
+
+
+        log_cfg = pj.LogConfig()
+        log_cfg.level = 4
+        log_cfg.console_level = 4
+
+        lib.init(ua_cfg=ua_cfg, media_cfg=media_cfg, log_cfg=log_cfg)
+
+        transport_cfg = pj.TransportConfig()
+        transport_cfg.bound_addr = "127.0.0.1"
+
+        media_cfg.srtp_secure_signaling = 0
+
+        return lib, transport_cfg
+
+    def start_pjsua(self):
+        print("--- Starting Single PJSIP Engine Core with Split Ports ---")
+
+        # Prepare configuration profiles
+        ua_cfg = pj.UAConfig()
+        ua_cfg.max_calls = 4
+
+        media_cfg = pj.MediaConfig()
+        media_cfg.no_vad = True        # Keep RTP stream active during tests
+        media_cfg.quality = 10
+
+        # Global core initialization
+        self.lib = pj.Lib.instance()
+        if self.lib is None:
+            self.lib = pj.Lib()
+        self.lib.init(ua_cfg=ua_cfg, media_cfg=media_cfg, log_cfg=pj.LogConfig(level=3))
+
+        # 2. Create Transports
+        tx_transport_cfg = pj.TransportConfig()
+        tx_transport_cfg.port = 5065
+        self.tx_transport = self.lib.create_transport(pj.TransportType.UDP, tx_transport_cfg)
+
+        rx_transport_cfg = pj.TransportConfig()
+        rx_transport_cfg.port = 5066
+        self.rx_transport = self.lib.create_transport(pj.TransportType.UDP, rx_transport_cfg)
+
+        self.lib.start()
+        self.lib.set_null_snd_dev()
+
+        # Poll loop events
+        from twisted.internet import task
+        def poll_pjsua_events():
+            if self.lib:
+                self.lib.handle_events(0)
+        self.pjsua_poller = task.LoopingCall(poll_pjsua_events)
+        self.pjsua_poller.start(0.020)
+
+        # Create and configure Receiver (102) Account
+        rx_acc_cfg = pj.AccountConfig()
+        rx_acc_cfg.id = "sip:102@127.0.0.1"
+        rx_acc_cfg.proxy = [ "sip:127.0.0.1:5060;lr" ]
+        rx_acc_cfg.txt_red_level = 2
+        rx_acc_cfg.txt_cnt = 1
+     
+        rx_acc_cfg.use_srtp = 2                  # 2 = Mandatory
+        rx_acc_cfg.srtp_secure_signaling = 0
+
+        self.rx_acc = self.lib.create_account(rx_acc_cfg, cb=MyAccountCallback())
+        self.rx_acc.set_transport(self.rx_transport)  # Pin to Port 5066
+
+        # Create and configure Caller (101) Account
+        tx_acc_cfg = pj.AccountConfig()
+        tx_acc_cfg.id = "sip:101@127.0.0.1"
+        tx_acc_cfg.proxy = [ "sip:127.0.0.1:5060;lr" ]
+        tx_acc_cfg.txt_red_level = 2
+        tx_acc_cfg.txt_cnt = 1
+
+        tx_acc_cfg.use_srtp = 2                  # 2 = Mandatory
+        tx_acc_cfg.srtp_secure_signaling = 0
+
+        self.tx_acc = self.lib.create_account(tx_acc_cfg)
+        self.tx_acc.set_transport(self.tx_transport)  #  Port 5065
+
+        reactor.callLater(3, self.make_call)
+
+    def make_call(self):
+        LOGGER.info("pjsua client: Dialing 102...")
+        call = pj.Call(self.lib, -1, cb=None)
+        call_cb = MyCallCallback(call, is_rx=False)
+        call.set_callback(call_cb)
+
+        msg_data = pj.Lib._create_msg_data(None)
+        dst_uri = "sip:102@127.0.0.1:5060"
+
+        err, cid = _pjsua.call_make_call(self.tx_acc._id, dst_uri, 0, call, msg_data)
+        self.lib._err_check("make_call()", self, err)
+
+        call.attach_to_id(cid)
+        self.tx_call = call
+
+        reactor.callLater(2, self.send_en)
+
+    def send_rtt_payload(self, call_obj, txt_payload):
+        #Helper to invoke call_send_text when _pjsua.call_send_text is available
+        print("\n[AH TEST_PY_DEBUG] CRITICAL: Inside send_rtt_payload NOW!")
+
+
+        if not call_obj:
+            print("[AH TEST_PY_DEBUG] ERROR: call_obj is missing!")
+            return
+
+        call_id = call_obj._id
+        byte_txt = txt_payload.encode('utf-8')
+
+        param = {
+                "med_idx": -1,
+                "text": byte_txt
+        }
+
+        print(f"--- Dispatching RTT: '{txt_payload}'  (Call ID: {call_id}) ---")
+        err = _pjsua.call_send_text(call_id, param)
+        print(f"--- Return Code: {err} ---")
+        return err
+
+    def send_en(self):
+        print("102 writing 'English'...")
+        LOGGER.info("102 writing 'English'...")
+        self.send_rtt_payload(self.tx_call, en_txt)
+        reactor.callLater(2, self.step_gr)
+
+    def send_en_im(self):
+        call_id = self.tx_call._id
+        print(f"Directly executing _pjsua.call_send_im..call_id = {call_id} ---")
+        msg_data = pj.Lib._create_msg_data(None)
+        err = _pjsua.call_send_im(call_id, "text/plain", en_txt, msg_data, 0)
+      
+        print("102 wrote 'English'...")
+        print(f"--- RESPONSE RECEIVED! Status Code: {err} ---")
+        LOGGER.info(f"--- RESPONSE RECEIVED! Status Code: {err} ---")
+
+        if err == 0:
+            print("SUCCESS! _pjsua.call_send_im completed with PJ_SUCCESS (0).")
+        else:
+            print(f"Returned error state: {err}")
+
+        reactor.callLater(2, self.step_gr)
+        #reactor.callLater(2, self.finish)
+    def step_gr(self):
+
+        print("102 writing 'Greek'...")
+        LOGGER.info(f"102 writing 'Greek'...")
+        self.send_rtt_payload(self.rx_call, gr_txt)
+        reactor.callLater(2, self.switch_to_voice_only)
+        #reactor.callLater(2, self.put_call_on_hold)
+        #reactor.callLater(2, self.step_de)
+
+    def step_gr_im(self):
+
+        call_id = self.tx_call._id
+
+        msg_data = pj.Lib._create_msg_data(None)
+        err = _pjsua.call_send_im(call_id, "text/plain", gr_txt, msg_data, 0)
+        print("102 wrote 'Greek'...")
+        print(f"--- RESPONSE RECEIVED! Status Code: {err} ---")
+        LOGGER.info(f"--- RESPONSE RECEIVED! Status Code: {err} ---")
+
+        if err == 0:
+            print("SUCCESS! _pjsua.call_send_im completed with PJ_SUCCESS (0).")
+        else:
+            print(f"Returned error state: {err}")
+        reactor.callLater(2, self.switch_to_voice_only)
+
+    def switch_to_voice_only(self):
+        print("--- SCENARIO TRIGGER: Modifying Call Media Stream Directions (Voice-Only) ---")
+        LOGGER.info("SCENARIO TRIGGER: Modifying call settings to turn off text stream")
+        call_id = self.tx_call._id
+        # Set media direction (PJSUA_CALL_SET_MEDIA_DIR = 16)
+        #Leave all other call settings (accounts, routing, or secure signaling) as they are
+        call_setting_flag = 16
+        # 0 = Inactive 1 = Send-only 2 = Receive-only 3 = Send-receive
+        # Set media directions: Audio (Index 0) = sendrecv (3), Text (Index 1) = inactive (0)
+        call_setting_media_dir = [3, 0]
+        print("Modifying Call: Deactivating text stream while maintaining audio...")
+        _pjsua.call_reinvite_settings(
+            call_id,
+            call_setting_flag,
+            call_setting_media_dir
+        )
+        reactor.callLater(4, self.switch_back_to_rtt)
+
+    def switch_back_to_rtt(self):
+        print("--- SCENARIO TRIGGER: Restoring RTT Streams Mid-Call ---")
+        LOGGER.info("SCENARIO TRIGGER: Modifying call settings to restore text stream")
+        call_id = self.tx_call._id
+        # Set media direction (PJSUA_CALL_SET_MEDIA_DIR = 16)
+        call_setting_flag = 16
+        # Set media directions: Audio (Index 0) = sendrecv (3), Text (Index 1) = inactive (0)
+        call_setting_media_dir = [3, 3]
+        print("Modifying Call: Reactivating text stream ...")
+        _pjsua.call_reinvite_settings(
+            call_id,
+            call_setting_flag,
+            call_setting_media_dir
+        )
+        LOGGER.info(f"Waking up RTT stream...")
+        #self.send_rtt_payload(self.tx_call, "\r\n")
+        #self.send_rtt_payload(self.tx_call, "\r\n")
+        #self.send_rtt_payload(self.tx_call, "\r\n")
+        #self.send_rtt_payload(self.tx_call, "\r\n")
+        reactor.callLater(2, self.step_wakeup102)
+        reactor.callLater(2, self.step_de)
+
+    def put_call_on_hold(self):
+        print("--- SCENARIO TRIGGER: Placing Call On Hold ---")
+        LOGGER.info("SCENARIO TRIGGER: Placing call on hold")
+        call_id = self.tx_call._id
+
+        print("Sending call hold request...")
+        err = _pjsua.call_set_hold(call_id, None)
+
+        print(f"--- HOLD RESPONSE RECEIVED! Status Code: {err} ---")
+        LOGGER.info(f"--- HOLD RESPONSE RECEIVED! Status Code: {err} ---")
+
+        reactor.callLater(3, self.resume_call_reinvite)
+
+    def resume_call_reinvite(self):
+        print("--- SCENARIO TRIGGER: Resuming Call via Re-INVITE ---")
+        LOGGER.info("SCENARIO TRIGGER: Resuming call via re-INVITE")
+        call_id = self.tx_call._id
+
+        # Setting unhold = 1  re-INVITE to active/resume the streams.
+        unhold_flag = 1
+
+        print("Sending re-INVITE to unhold/resume stream...")
+        err = _pjsua.call_reinvite(call_id, unhold_flag, None)
+
+        print(f"--- RE-INVITE RESPONSE RECEIVED! Status Code: {err} ---")
+        LOGGER.info(f"--- RE-INVITE RESPONSE RECEIVED! Status Code: {err} ---")
+        reactor.callLater(2, self.step_wakeup102)
+        reactor.callLater(2, self.step_wakeup101)
+        reactor.callLater(2, self.step_de)
+    def step_de(self):
+        print("101 writing 'German'...")
+        LOGGER.info(f"101 writing 'German'...")
+        self.send_rtt_payload(self.tx_call, de_txt)        
+        reactor.callLater(2, self.step_cn)
+    def step_wakeup102(self):
+        print("102 wakeup'...")
+        LOGGER.info(f"102 wakeup'...")
+        self.send_rtt_payload(self.tx_call, wakeup_txt)
+    def step_wakeup101(self):
+        print("101 wakeup'...")
+        LOGGER.info(f"101 wakeup'...")
+        self.send_rtt_payload(self.rx_call, wakeup_txt)
+    
+    def step_de_im(self):
+        call_id = self.tx_call._id
+        msg_data = pj.Lib._create_msg_data(None)
+        err = _pjsua.call_send_im(call_id, "text/plain", de_txt, msg_data, 0)
+
+        print("101 wrote 'German'...")
+        print(f"--- RESPONSE RECEIVED! Status Code: {err} ---")
+        LOGGER.info(f"--- RESPONSE RECEIVED! Status Code: {err} ---")
+
+        if err == 0:
+            print("SUCCESS! _pjsua.call_send_im completed with PJ_SUCCESS (0).")
+        else:
+            print(f"Returned error state: {err}")
+
+        reactor.callLater(2, self.step_cn)
+
+    def step_cn(self):        
+        print("102 writing 'Chinese'...")
+        LOGGER.info(f"102 writing 'Chinese'...")
+        self.send_rtt_payload(self.rx_call, cn_txt)
+        reactor.callLater(2, self.step_am)
+
+    def step_am(self):
+        print("101 writing 'Armenian'...")
+        LOGGER.info(f"101 writing 'Armenian'...")
+        self.send_rtt_payload(self.tx_call, am_txt)
+        reactor.callLater(2, self.step_hi)
+
+    def step_hi(self):
+        print("102 writing 'Hindi'...")
+        LOGGER.info(f"102 writing 'Hindi'...")
+        self.send_rtt_payload(self.rx_call, hi_txt)
+        reactor.callLater(2, self.finish)
+
+
+    def finish(self):
+        global TX_LOG_BUFFER, RX_LOG_BUFFER
+        LOGGER.info("Verifying message exchange...")
+        print("Verifying message exchange...")
+
+        # Write out our captured  text results for local troubleshooting verification
+        with open("/tmp/full_pjsua_output.log", "w", encoding='utf-8') as f:
+            f.write("========== TX OUTPUT (101) ==========\n")
+            f.write(TX_LOG_BUFFER)
+            f.write("\n\n========== RX OUTPUT (102) ==========\n")
+            f.write(RX_LOG_BUFFER)
+
+        self.stop_reactor()
+
+        # Validate our localized memory strings populated dynamically during call loop execution
+        rx_saw_english = "Incoming text" in RX_LOG_BUFFER and en_txt in RX_LOG_BUFFER
+        tx_saw_greek = "Incoming text" in TX_LOG_BUFFER and gr_txt in TX_LOG_BUFFER
+        rx_saw_german = "Incoming text" in RX_LOG_BUFFER and de_txt in RX_LOG_BUFFER
+        tx_saw_chinese = "Incoming text" in TX_LOG_BUFFER and cn_txt in TX_LOG_BUFFER
+        rx_saw_armenian = "Incoming text" in RX_LOG_BUFFER and am_txt in RX_LOG_BUFFER
+        tx_saw_hindi = "Incoming text" in TX_LOG_BUFFER and hi_txt in TX_LOG_BUFFER
+
+        if rx_saw_english and tx_saw_greek and rx_saw_german and tx_saw_chinese and rx_saw_armenian and tx_saw_hindi:
+            LOGGER.info("SUCCESS: RTT exchange confirmed via native engine wrapper state evaluation!")
+            print("SUCCESS.")
+            self.passed = True
+        else:
+            if not rx_saw_english: LOGGER.error("FAILURE: 102 (Receiver) never saw 'English'")
+            if not tx_saw_greek:   LOGGER.error("FAILURE: 101 (Caller) never saw 'Greek'")
+            if not rx_saw_german:  LOGGER.error("FAILURE: 102 (Receiver) never saw 'German'")
+            if not tx_saw_chinese: LOGGER.error("FAILURE: 101 (Caller) never saw 'Chinese'")
+            if not rx_saw_armenian: LOGGER.error("FAILURE: 102 (Receiver) never saw 'Armenian'")
+            if not tx_saw_hindi:    LOGGER.error("FAILURE: 101 (Caller) never saw 'Hindi'")
+            self.passed = False
+
+    def stop_reactor(self):
+        # Gracefully teardown and destroy the library execution processes mapping
+        #try:
+        #    if self.tx_lib:
+        #        self.tx_lib.destroy()
+        #    if self.rx_lib:
+        #        self.rx_lib.destroy()
+        #except Exception:
+        #    pass
+        #super(SRTPTest, self).stop_reactor()
+        print("--- Teardown: Stopping PJSUA Poller and Destroying PJSIP Engine ---")
+        LOGGER.info("Teardown: Stopping PJSUA Poller and Destroying PJSIP Engine")
+
+        try:
+            if hasattr(self, 'pjsua_poller') and self.pjsua_poller.running:
+                self.pjsua_poller.stop()
+        except Exception as e:
+            LOGGER.error(f"Error stopping poller: {e}")
+
+        try:
+            if hasattr(self, 'lib') and self.lib:
+                # Disconnect any calls before destroying to prevent hanging threads
+                if hasattr(self, 'tx_call') and self.tx_call:
+                    self.tx_call.hangup()
+                if hasattr(self, 'rx_call') and self.rx_call:
+                    self.rx_call.hangup()
+
+                self.lib.destroy()
+                self.lib = None
+        except Exception as e:
+            LOGGER.error(f"Error destroying PJSIP library: {e}")
+
+        # 3. Hand over control to the Asterisk Test Suite TestCase class to clean up the rest
+        super(SRTPTest, self).stop_reactor()
+
+
+def main():
+    test = SRTPTest()
+    reactor.run()
+    return 0 if test.passed else 1
+
+if __name__ == "__main__":
+    sys.exit(main() or 0)
